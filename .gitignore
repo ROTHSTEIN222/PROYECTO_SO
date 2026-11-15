@@ -1,0 +1,14 @@
+# Material de clase, enunciado y notas de cambios (no se suben)
+docs/
+
+# Archivos de macOS
+.DS_Store
+
+# Compilacion
+*.o
+generadorCSV
+agentePais
+servidorISE
+
+# Ficheros generados al probar
+encuestas_*.csv
