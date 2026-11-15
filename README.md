@@ -123,6 +123,10 @@ Mensaje de finalización enviado.
 Envío ES finalizado satisfactoriamente!!.
 ```
 
+Si el servidor se cae o se le acaba el tiempo mientras un agente envía, el
+agente avisa que perdió la conexión y termina de forma ordenada. Si un agente
+se cae, el servidor lo marca como desconectado y sigue atendiendo a los demás.
+
 Cuando un agente termina, el servidor imprime su **reporte parcial**. Cuando
 se acaba el tiempo, imprime el **resumen general ISE** y el padre indica si el
 servidor finalizó con éxito. El pipe nominal se borra al terminar.
@@ -156,6 +160,10 @@ make
 | Tiempo agotado a mitad de envío | Servidor con `-t 30`, lanzar un agente con FR al 100 % cerca del segundo 30 | El servidor lo marca como "incompleto" y el agente muestra error al enviar. |
 | Servidor sin agentes | `./servidorISE -b 5 -p ise_fifo -t 30 -a 2` y no lanzar agentes | "No se conectó ningún agente." |
 | Ctrl+C en el servidor | Presionar Ctrl+C mientras corre | Termina y borra el pipe (`ls ise_fifo` ya no lo encuentra). |
+| `kill` al servidor | `kill <pid del servidor>` desde otra terminal | Termina el proceso hijo, borra el pipe y muestra "Servidor ISE interrumpido." |
+| Se cae el servidor mientras un agente envía | Ctrl+C al servidor mientras un agente con FR al 100 % está enviando | El agente no se cae de golpe: muestra "Se perdió la conexión con el servidor ISE" y cuántas encuestas alcanzó a enviar. |
+| Pipe abandonado | `mkfifo prueba` (sin servidor) y luego `./agentePais -n encuestas_ES.csv -p prueba` | A los 10 segundos: "No se pudo conectar: el servidor ISE no responde." |
+| Se cae un agente | Ctrl+C a un agente mientras envía | El servidor lo detecta, imprime su reporte parcial indicando que se desconectó y en el resumen sale "(incompleto: agente desconectado)". |
 | Tiempo fuera de rango | `./servidorISE -b 5 -p ise_fifo -t 10 -a 2` | Error: time entre 30 y 120. |
 | Demasiados agentes | `./servidorISE -b 5 -p ise_fifo -t 30 -a 5` | Error: hilos entre 1 y 4. |
 | País inválido | `./generadorCSV -p XX -e 50` | Error: use ES, FR o IT. |
