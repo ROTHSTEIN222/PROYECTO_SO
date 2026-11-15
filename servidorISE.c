@@ -1,425 +1,516 @@
 /*
  * servidorISE.c - Control Proceso Principal ISE
  *
- * Uso: ./servidorISE -b <tamB> -p <PipeN> -t <time> -a <agentes>   (flags en cualquier orden)
+ * Uso: ./servidorISE -b <tamB> -p <PipeN> -t <time> -a <hilos>   (flags en cualquier orden)
  *
- * Estructura:
- *   - Proceso padre : crea el pipe nominal, lanza al hijo, espera su fin y
- *                     muestra si termino con exito.
- *   - Proceso hijo  : ejecuta el servidor con 3 tipos de hilos:
- *       * Hilo temporizador : espera <time> segundos y marca el fin.
- *       * Hilo recolector   : lee el pipe y reparte cada registro al buffer
- *                             del agente correspondiente.
- *       * Hilo por agente   : consume su buffer (tamB registros), acumula
- *                             promedios y emite el reporte parcial.
- *   - Sincronizacion productor/consumidor con semaforos POSIX (vacios/llenos).
- *
- * Compilar: gcc -Wall -Wextra -pedantic -std=c11 -pthread -o servidorISE servidorISE.c
+ * Estructura (Figura 1 del enunciado):
+ *   - Proceso padre: crea el pipe nominal, crea al hijo, espera a que
+ *     termine y muestra si finalizo con exito o no.
+ *   - Proceso hijo: recibe las encuestas y muestra el resumen final.
+ *     Usa estos hilos POSIX:
+ *       * Hilo temporizador: espera <time> segundos y avisa el fin.
+ *       * Hilo recolector: lee el pipe y deja cada encuesta en el
+ *         buffer del agente que la envio (productor).
+ *       * Un hilo por agente: saca las encuestas de su buffer, acumula
+ *         promedios y emite el reporte parcial (consumidor).
+ *   - Cada buffer es circular de <tamB> registros y se sincroniza con
+ *     3 semaforos POSIX (huecos, elementos y mutex), como en clase.
  */
-#define _POSIX_C_SOURCE 200809L
-
-#include <ctype.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <pthread.h>
-#include <semaphore.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
+#include <errno.h>
+#include <signal.h>
+#include <fcntl.h>
 #include <unistd.h>
-
+#include <pthread.h>
+#include <semaphore.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include "ise.h"
 
 #define MAX_AGENTES  4
-#define T_MIN        30
-#define T_MAX        120
-#define TAMB_MAX     1000000
-#define SENT_FIN     (-1)   /* centinela: el agente termino su envio   */
-#define SENT_TIMEOUT (-2)   /* centinela: se agoto el tiempo del server */
+#define TIEMPO_MIN   30
+#define TIEMPO_MAX   120
 
-typedef struct { int sector; double valor; } registro_t;
+/* Valores especiales de sector para avisar al hilo del agente que termine */
+#define FIN_AGENTE   -1   /* el agente envio todas sus encuestas */
+#define FIN_TIEMPO   -2   /* se acabo el tiempo del servidor     */
+
+typedef struct {
+    int    sector;
+    double sentimiento;
+} registro_t;
 
 typedef struct {
     pid_t       pid;
     char        pais[3];
-    registro_t *buf;                 /* buffer circular de tamB registros */
-    int         tam, in, out;
-    sem_t       vacios, llenos;
+    char        nombre[TAM_NOMBRE];
+    registro_t *buffer;          /* buffer circular de tamB registros */
+    int         entrada, salida; /* posicion del productor y del consumidor */
+    sem_t       huecos;          /* espacios libres del buffer  */
+    sem_t       elementos;       /* registros listos para leer  */
+    sem_t       mutex;           /* acceso exclusivo al buffer  */
     pthread_t   hilo;
-    int         fin_recibido;
+    int         terminado;       /* 1 si ya llego el MSG_FIN    */
+    long        cantidad[NUM_SECTORES];
     double      suma[NUM_SECTORES];
-    long        cuenta[NUM_SECTORES];
 } agente_t;
 
-static const char *const SECTORES[NUM_SECTORES] = {
-    "Industria", "Servicios", "Consumidores", "Comercio", "Construccion"
-};
-static const int PESOS[NUM_SECTORES] = { 40, 30, 20, 5, 5 };
-
+/* Datos globales: los comparten todos los hilos del proceso */
 static agente_t agentes[MAX_AGENTES];
-static int n_agentes = 0;
-static int max_agentes, tam_b, tiempo;
-static const char *nombre_pipe;
-static int fd_pipe = -1, fd_aux = -1;
-static volatile sig_atomic_t terminar = 0;
-static pthread_mutex_t mtx_print = PTHREAD_MUTEX_INITIALIZER;
+static int num_agentes = 0;
+static int tam_buffer, tiempo, max_agentes;
+static char *nombre_pipe;
+static pthread_mutex_t mutex_pantalla = PTHREAD_MUTEX_INITIALIZER;
 
-/* ------------------------------ Utilidades ------------------------------- */
-
-static void esperar(sem_t *s)
+static void uso(void)
 {
-    while (sem_wait(s) != 0 && errno == EINTR) { }
+    fprintf(stderr, "Uso: ./servidorISE -b <tamB> -p <PipeN> -t <time> -a <hilos>\n");
+    fprintf(stderr, "  -b  tamano del buffer por agente (registros, >= 1)\n");
+    fprintf(stderr, "  -p  nombre del pipe nominal\n");
+    fprintf(stderr, "  -t  tiempo de servicio en segundos (%d a %d)\n", TIEMPO_MIN, TIEMPO_MAX);
+    fprintf(stderr, "  -a  cantidad maxima de agentes/hilos (1 a %d)\n", MAX_AGENTES);
 }
 
-/* Recomendacion segun el enunciado: >50 Vender, <50 Comprar, =50 Neutro. */
-static const char *recomendar(double ise)
+/* Ctrl+C: se borra el pipe nominal para no dejar basura en el disco */
+static void manejador_sigint(int sig)
 {
-    long v = (long)(ise * 100.0 + 0.5);   /* comparacion a 2 decimales */
-    if (v > 5000) return "VENDER";
-    if (v < 5000) return "COMPRAR";
-    return "NEUTRO";
+    ssize_t n;
+
+    (void) sig;
+    unlink(nombre_pipe);
+    n = write(STDOUT_FILENO, "\nServidor ISE interrumpido.\n", 28);
+    (void) n;
+    _exit(1);
 }
 
-/* ISE = media ponderada de los promedios por sector (pesos 40/30/20/5/5);
- * si falta algun sector se renormalizan los pesos de los presentes. */
-static void imprimir_reporte(const char *titulo, const char *pais,
-                             const double suma[], const long cuenta[])
-{
-    long total = 0;
-    double acum = 0.0;
-    int pesos = 0;
+/* ---------------------------- Calculos ---------------------------------- */
 
-    pthread_mutex_lock(&mtx_print);
-    printf("\n===== %s (%s) =====\n", titulo, pais);
-    for (int s = 0; s < NUM_SECTORES; s++) {
-        if (cuenta[s] > 0) {
-            double prom = suma[s] / (double)cuenta[s];
-            printf("  %-13s: %6ld encuestas, promedio %.2f%%\n",
-                   SECTORES[s], cuenta[s], prom);
-            acum += PESOS[s] * prom;
-            pesos += PESOS[s];
-            total += cuenta[s];
-        } else {
-            printf("  %-13s: sin datos\n", SECTORES[s]);
+/* printf cuenta bytes y no letras: en UTF-8 la "ó" ocupa 2 bytes, asi que
+ * se suma 1 al ancho por cada byte extra para que las columnas cuadren */
+static int ancho(const char *texto, int columnas)
+{
+    int i;
+
+    for (i = 0; texto[i] != '\0'; i++) {
+        if ((texto[i] & 0xC0) == 0x80)   /* byte de continuacion UTF-8 */
+            columnas++;
+    }
+    return columnas;
+}
+
+/*
+ * ISE = media ponderada de los promedios por sector (pesos 40/30/20/5/5).
+ * Si un sector no tiene encuestas, su peso se reparte entre los demas.
+ * Devuelve -1 si no hay ninguna encuesta.
+ */
+static double calcular_ise(double suma[], long cantidad[])
+{
+    double ise = 0.0;
+    int s, peso_total = 0;
+
+    for (s = 0; s < NUM_SECTORES; s++) {
+        if (cantidad[s] > 0) {
+            ise += PESOS[s] * (suma[s] / cantidad[s]);
+            peso_total += PESOS[s];
         }
     }
-    if (total == 0) {
-        printf("  Sin encuestas recibidas.\n");
-    } else {
-        double ise = acum / pesos;
-        printf("  Total: %ld | ISE: %.2f%% -> %s\n", total, ise, recomendar(ise));
-    }
-    fflush(stdout);
-    pthread_mutex_unlock(&mtx_print);
+    if (peso_total == 0)
+        return -1.0;
+    return ise / peso_total;
 }
 
-/* ------------------------ Buffer por agente (productor) ------------------ */
-
-static void encolar(agente_t *a, int sector, double valor)
+static void imprimir_reporte_parcial(agente_t *a)
 {
-    esperar(&a->vacios);
-    a->buf[a->in].sector = sector;
-    a->buf[a->in].valor = valor;
-    a->in = (a->in + 1) % a->tam;
-    sem_post(&a->llenos);
+    long total = 0;
+    double ise;
+    int s;
+
+    pthread_mutex_lock(&mutex_pantalla);   /* que no se mezcle con otros hilos */
+    printf("\n----- Reporte parcial: %s (%s) -----\n", a->pais, a->nombre);
+    for (s = 0; s < NUM_SECTORES; s++) {
+        if (a->cantidad[s] > 0)
+            printf("  %-*s %6ld encuestas, promedio %6.2f%%\n",
+                   ancho(SECTORES[s], 14), SECTORES[s],
+                   a->cantidad[s], a->suma[s] / a->cantidad[s]);
+        else
+            printf("  %-*s %6d encuestas\n", ancho(SECTORES[s], 14), SECTORES[s], 0);
+        total += a->cantidad[s];
+    }
+    ise = calcular_ise(a->suma, a->cantidad);
+    printf("  Total recibidas: %ld\n", total);
+    printf("  ISE %s: %.2f%% -> %s\n", a->pais, ise, recomendacion(ise));
+    fflush(stdout);
+    pthread_mutex_unlock(&mutex_pantalla);
+}
+
+static void imprimir_resumen_general(void)
+{
+    double suma[NUM_SECTORES] = { 0 };
+    long cantidad[NUM_SECTORES] = { 0 };
+    long total;
+    double ise;
+    int i, s;
+
+    printf("\n╔═══════════════════════════════════════════════════════════════╗\n");
+    printf("║                  RESUMEN GENERAL ISE                          ║\n");
+    printf("╚═══════════════════════════════════════════════════════════════╝\n");
+    if (num_agentes == 0) {
+        printf("No se conectó ningún agente.\n");
+        return;
+    }
+    for (i = 0; i < num_agentes; i++) {
+        agente_t *a = &agentes[i];
+        total = 0;
+        for (s = 0; s < NUM_SECTORES; s++) {
+            total += a->cantidad[s];
+            suma[s] += a->suma[s];          /* acumulado de todos los paises */
+            cantidad[s] += a->cantidad[s];
+        }
+        ise = calcular_ise(a->suma, a->cantidad);
+        if (ise < 0)
+            printf("  %s (%s): sin encuestas\n", a->pais, a->nombre);
+        else
+            printf("  %s (%s): %ld encuestas, ISE %.2f%% -> %s%s\n", a->pais,
+                   a->nombre, total, ise, recomendacion(ise),
+                   a->terminado ? "" : " (incompleto: tiempo agotado)");
+    }
+
+    printf("\n  Promedio por sector (todos los países):\n");
+    for (s = 0; s < NUM_SECTORES; s++) {
+        if (cantidad[s] > 0)
+            printf("  %-*s %6ld encuestas, promedio %6.2f%% (peso %d%%)\n",
+                   ancho(SECTORES[s], 14), SECTORES[s], cantidad[s],
+                   suma[s] / cantidad[s], PESOS[s]);
+        else
+            printf("  %-*s %6d encuestas (peso %d%%)\n",
+                   ancho(SECTORES[s], 14), SECTORES[s], 0, PESOS[s]);
+    }
+    ise = calcular_ise(suma, cantidad);
+    if (ise < 0)
+        printf("\n  ISE global: sin encuestas\n");
+    else
+        printf("\n  ISE global: %.2f%% -> Recomendación: %s\n", ise, recomendacion(ise));
+}
+
+/* ---------------------- Buffer productor-consumidor ---------------------- */
+
+/* Productor (hilo recolector): deja un registro en el buffer del agente */
+static void depositar(agente_t *a, int sector, double sentimiento)
+{
+    sem_wait(&a->huecos);      /* espera a que haya espacio */
+    sem_wait(&a->mutex);
+    a->buffer[a->entrada].sector = sector;
+    a->buffer[a->entrada].sentimiento = sentimiento;
+    a->entrada = (a->entrada + 1) % tam_buffer;
+    sem_post(&a->mutex);
+    sem_post(&a->elementos);   /* avisa que hay un registro nuevo */
+}
+
+/* Consumidor: un hilo por agente que vacia su buffer */
+static void *hilo_agente(void *arg)
+{
+    agente_t *a = (agente_t *) arg;
+    registro_t r;
+
+    do {
+        sem_wait(&a->elementos);   /* espera a que haya registros */
+        sem_wait(&a->mutex);
+        r = a->buffer[a->salida];
+        a->salida = (a->salida + 1) % tam_buffer;
+        sem_post(&a->mutex);
+        sem_post(&a->huecos);      /* libera un espacio */
+
+        if (r.sector >= 0) {
+            a->suma[r.sector] += r.sentimiento;
+            a->cantidad[r.sector]++;
+        }
+    } while (r.sector >= 0);
+
+    /* Solo emite reporte parcial si el agente termino de enviar */
+    if (r.sector == FIN_AGENTE)
+        imprimir_reporte_parcial(a);
+    pthread_exit(NULL);
+}
+
+/* ----------------------------- Agentes ----------------------------------- */
+
+static agente_t *buscar_agente(pid_t pid)
+{
+    int i;
+
+    for (i = 0; i < num_agentes; i++) {
+        if (agentes[i].pid == pid)
+            return &agentes[i];
+    }
+    return NULL;
+}
+
+/* Registra un agente nuevo: buffer, semaforos y su hilo */
+static void registrar_agente(mensaje_t *msg)
+{
+    agente_t *a;
+    int error;
+
+    if (num_agentes == max_agentes) {
+        pthread_mutex_lock(&mutex_pantalla);
+        printf("\nAgente %s (%s) rechazado: ya hay %d agentes conectados.\n",
+               msg->pais, msg->nombre, max_agentes);
+        pthread_mutex_unlock(&mutex_pantalla);
+        /* El pipe va en un solo sentido: se le avisa al agente con una senal */
+        if (kill(msg->pid, SIGUSR1) < 0)
+            perror("Error en kill");
+        return;
+    }
+
+    a = &agentes[num_agentes];
+    memset(a, 0, sizeof(agente_t));
+    a->pid = msg->pid;
+    strcpy(a->pais, msg->pais);
+    strcpy(a->nombre, msg->nombre);
+    a->buffer = (registro_t *) malloc(tam_buffer * sizeof(registro_t));
+    if (a->buffer == NULL) {
+        perror("Error en malloc");
+        exit(1);
+    }
+    /* El segundo argumento en 0 indica semaforo compartido entre hilos */
+    if (sem_init(&a->huecos, 0, tam_buffer) < 0 ||
+        sem_init(&a->elementos, 0, 0) < 0 ||
+        sem_init(&a->mutex, 0, 1) < 0) {
+        perror("Error en sem_init");
+        exit(1);
+    }
+    error = pthread_create(&a->hilo, NULL, hilo_agente, a);
+    if (error != 0) {
+        fprintf(stderr, "Error en pthread_create: %s\n", strerror(error));
+        exit(1);
+    }
+    num_agentes++;
+
+    pthread_mutex_lock(&mutex_pantalla);
+    printf("\nAgente conectado: %s (país %s, pid %d)\n", a->nombre, a->pais, (int) a->pid);
+    fflush(stdout);
+    pthread_mutex_unlock(&mutex_pantalla);
+}
+
+/* Procesa un mensaje del pipe. Devuelve 0 cuando hay que dejar de leer */
+static int procesar_mensaje(mensaje_t *msg)
+{
+    agente_t *a;
+
+    switch (msg->tipo) {
+    case MSG_CONEXION:
+        registrar_agente(msg);
+        break;
+    case MSG_ENCUESTA:
+        a = buscar_agente(msg->pid);
+        if (a != NULL && !a->terminado)   /* si fue rechazado se ignora */
+            depositar(a, msg->sector, msg->sentimiento);
+        break;
+    case MSG_FIN:
+        a = buscar_agente(msg->pid);
+        if (a != NULL && !a->terminado) {
+            a->terminado = 1;
+            depositar(a, FIN_AGENTE, 0.0);
+        }
+        break;
+    case MSG_TIEMPO:
+        return 0;
+    }
+    return 1;
 }
 
 /* ------------------------------- Hilos ----------------------------------- */
 
-static void *hilo_consumidor(void *arg)
-{
-    agente_t *a = arg;
-    registro_t r;
-
-    for (;;) {
-        esperar(&a->llenos);
-        r = a->buf[a->out];
-        a->out = (a->out + 1) % a->tam;
-        sem_post(&a->vacios);
-        if (r.sector < 0) break;                 /* centinela */
-        a->suma[r.sector] += r.valor;
-        a->cuenta[r.sector]++;
-    }
-    if (r.sector == SENT_FIN) {
-        imprimir_reporte("REPORTE PARCIAL", a->pais, a->suma, a->cuenta);
-    }
-    return NULL;
-}
-
-static void *hilo_temporizador(void *arg)
-{
-    unsigned restante = (unsigned)tiempo;
-    (void)arg;
-    while (restante > 0) restante = sleep(restante);
-    terminar = 1;
-    return NULL;
-}
-
-static agente_t *buscar(pid_t pid)
-{
-    for (int i = 0; i < n_agentes; i++) {
-        if (agentes[i].pid == pid) return &agentes[i];
-    }
-    return NULL;
-}
-
-static void conectar_agente(const mensaje_t *m)
-{
-    agente_t *a;
-
-    if (buscar(m->pid) != NULL) return;
-    if (n_agentes >= max_agentes) {
-        printf("Agente %.2s (pid %d) rechazado: maximo de %d agentes\n",
-               m->pais, (int)m->pid, max_agentes);
-        return;
-    }
-    a = &agentes[n_agentes];
-    memset(a, 0, sizeof *a);
-    a->pid = m->pid;
-    memcpy(a->pais, m->pais, 2);
-    a->tam = tam_b;
-    a->buf = calloc((size_t)tam_b, sizeof(registro_t));
-    if (a->buf == NULL) { perror("calloc"); return; }
-    if (sem_init(&a->vacios, 0, (unsigned)tam_b) != 0) {
-        perror("sem_init"); free(a->buf); return;
-    }
-    if (sem_init(&a->llenos, 0, 0) != 0) {
-        perror("sem_init"); sem_destroy(&a->vacios); free(a->buf); return;
-    }
-    if (pthread_create(&a->hilo, NULL, hilo_consumidor, a) != 0) {
-        fprintf(stderr, "Error: no se pudo crear el hilo del agente\n");
-        sem_destroy(&a->vacios); sem_destroy(&a->llenos); free(a->buf);
-        return;
-    }
-    n_agentes++;
-    printf("Agente conectado: %s (pid %d)\n", a->pais, (int)a->pid);
-    fflush(stdout);
-}
-
-static void procesar(const mensaje_t *m)
-{
-    agente_t *a;
-
-    if (m->tipo == MSG_HELLO) { conectar_agente(m); return; }
-    a = buscar(m->pid);
-    if (a == NULL || a->fin_recibido) return;     /* agente no registrado */
-
-    if (m->tipo == MSG_DATO) {
-        if (m->sector >= 0 && m->sector < NUM_SECTORES &&
-            m->sentimiento >= 0.0 && m->sentimiento <= 100.0) {
-            encolar(a, m->sector, m->sentimiento);
-        }
-    } else if (m->tipo == MSG_FIN) {
-        a->fin_recibido = 1;
-        encolar(a, SENT_FIN, 0.0);
-    }
-}
-
+/* Lee el pipe nominal y reparte cada encuesta al buffer de su agente */
 static void *hilo_recolector(void *arg)
 {
-    mensaje_t m;
-    size_t off = 0;
-    (void)arg;
+    mensaje_t msg;
+    int fd, n = 0, seguir = 1;
 
-    while (!terminar) {
-        struct pollfd p = { fd_pipe, POLLIN, 0 };
-        int r = poll(&p, 1, 200);               /* despierta para ver 'terminar' */
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            perror("poll"); break;
+    (void) arg;
+    while (seguir) {
+        /* open se bloquea hasta que haya un escritor (agente o temporizador) */
+        fd = open(nombre_pipe, O_RDONLY);
+        if (fd < 0) {
+            perror("Error al abrir el pipe");
+            exit(1);
         }
-        if (r == 0) continue;
-        ssize_t n = read(fd_pipe, (char *)&m + off, sizeof m - off);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EINTR) continue;
-            perror("read"); break;
+        /* Cada write del agente es atomico (< PIPE_BUF), asi que read
+         * devuelve mensajes completos. read devuelve 0 cuando ya no queda
+         * ningun escritor: se cierra y se vuelve a abrir para esperar otro */
+        while (seguir && (n = read(fd, &msg, sizeof(mensaje_t))) > 0) {
+            if (n == sizeof(mensaje_t))
+                seguir = procesar_mensaje(&msg);
         }
-        off += (size_t)n;
-        if (off < sizeof m) continue;
-        off = 0;
-        procesar(&m);
+        if (n < 0)
+            perror("Error al leer el pipe");
+        close(fd);
     }
-    return NULL;
+    pthread_exit(NULL);
+}
+
+/* Espera el tiempo del servidor y avisa al recolector por el mismo pipe */
+static void *hilo_temporizador(void *arg)
+{
+    mensaje_t msg;
+    int fd;
+
+    (void) arg;
+    sleep(tiempo);
+
+    pthread_mutex_lock(&mutex_pantalla);
+    printf("\nTiempo agotado (%d segundos).\n", tiempo);
+    fflush(stdout);
+    pthread_mutex_unlock(&mutex_pantalla);
+
+    /* El recolector puede estar bloqueado en open() o read(): este
+     * mensaje lo despierta y le indica que deje de leer */
+    fd = open(nombre_pipe, O_WRONLY);
+    if (fd < 0) {
+        perror("Error al abrir el pipe (temporizador)");
+        exit(1);
+    }
+    memset(&msg, 0, sizeof(msg));
+    msg.tipo = MSG_TIEMPO;
+    if (write(fd, &msg, sizeof(msg)) != sizeof(msg))
+        perror("Error al escribir en el pipe (temporizador)");
+    close(fd);
+    pthread_exit(NULL);
 }
 
 /* ------------------------- Proceso hijo (servidor) ----------------------- */
 
-static int ejecutar_servidor(void)
+static int servidor(void)
 {
-    pthread_t t_rec, t_tim;
-    int estado = EXIT_SUCCESS;
-    double gs[NUM_SECTORES] = { 0 };
-    long gc[NUM_SECTORES] = { 0 };
+    pthread_t recolector, temporizador;
+    int i;
 
-    fd_pipe = open(nombre_pipe, O_RDONLY | O_NONBLOCK);
-    if (fd_pipe < 0) { perror("open (lectura del pipe)"); return EXIT_FAILURE; }
-    /* Escritor ficticio: evita EOF/POLLHUP cuando no hay agentes conectados. */
-    fd_aux = open(nombre_pipe, O_WRONLY);
-    if (fd_aux < 0) { perror("open (escritor auxiliar)"); close(fd_pipe); return EXIT_FAILURE; }
-
-    printf("Servidor ISE activo: pipe '%s', %d s, buffer %d, max %d agentes\n",
-           nombre_pipe, tiempo, tam_b, max_agentes);
+    printf("\n╔═══════════════════════════════════════════════════════════════╗\n");
+    printf("║         SERVIDOR ISE - CONTROL PROCESO PRINCIPAL              ║\n");
+    printf("╚═══════════════════════════════════════════════════════════════╝\n\n");
+    printf("Pipe: %s\n", nombre_pipe);
+    printf("Tiempo: %d segundos\n", tiempo);
+    printf("Buffer: %d registros por agente\n", tam_buffer);
+    printf("Agentes máximos: %d\n", max_agentes);
+    printf("Esperando agentes...\n");
     fflush(stdout);
 
-    if (pthread_create(&t_rec, NULL, hilo_recolector, NULL) != 0) {
-        fprintf(stderr, "Error: no se pudo crear el hilo recolector\n");
-        close(fd_pipe); close(fd_aux);
-        return EXIT_FAILURE;
+    if (pthread_create(&temporizador, NULL, hilo_temporizador, NULL) != 0 ||
+        pthread_create(&recolector, NULL, hilo_recolector, NULL) != 0) {
+        fprintf(stderr, "Error al crear los hilos del servidor\n");
+        return 1;
     }
-    if (pthread_create(&t_tim, NULL, hilo_temporizador, NULL) != 0) {
-        fprintf(stderr, "Error: no se pudo crear el hilo temporizador\n");
-        terminar = 1;
-        estado = EXIT_FAILURE;
-    } else {
-        pthread_join(t_tim, NULL);
-    }
-    pthread_join(t_rec, NULL);
+    pthread_join(temporizador, NULL);
+    pthread_join(recolector, NULL);
 
-    /* Cierra los hilos de agentes: los que no terminaron reciben centinela. */
-    for (int i = 0; i < n_agentes; i++) {
-        if (!agentes[i].fin_recibido) encolar(&agentes[i], SENT_TIMEOUT, 0.0);
+    /* A los agentes que no terminaron se les avisa que se acabo el tiempo */
+    for (i = 0; i < num_agentes; i++) {
+        if (!agentes[i].terminado)
+            depositar(&agentes[i], FIN_TIEMPO, 0.0);
         pthread_join(agentes[i].hilo, NULL);
     }
-    close(fd_pipe);
-    close(fd_aux);
 
-    printf("\n######## RESUMEN GENERAL ISE ########\n");
-    if (n_agentes == 0) printf("No se conecto ningun agente.\n");
-    for (int i = 0; i < n_agentes; i++) {
-        agente_t *a = &agentes[i];
-        imprimir_reporte(a->fin_recibido ? "RESUMEN FINAL"
-                                         : "RESUMEN FINAL (INCOMPLETO: TIEMPO AGOTADO)",
-                         a->pais, a->suma, a->cuenta);
-        for (int s = 0; s < NUM_SECTORES; s++) {
-            gs[s] += a->suma[s];
-            gc[s] += a->cuenta[s];
-        }
-        sem_destroy(&a->vacios);
-        sem_destroy(&a->llenos);
-        free(a->buf);
+    imprimir_resumen_general();
+
+    for (i = 0; i < num_agentes; i++) {
+        sem_destroy(&agentes[i].huecos);
+        sem_destroy(&agentes[i].elementos);
+        sem_destroy(&agentes[i].mutex);
+        free(agentes[i].buffer);
     }
-    if (n_agentes > 0) imprimir_reporte("ISE GLOBAL", "TODOS", gs, gc);
-    return estado;
-}
-
-/* ---------------------------- Argumentos / main -------------------------- */
-
-static void mostrar_uso(void)
-{
-    fprintf(stderr,
-            "Uso: ./servidorISE -b <tamB> -p <PipeN> -t <time> -a <agentes>\n"
-            "  -b  tamano del buffer por agente en registros (1..%d)\n"
-            "  -p  nombre del pipe nominal\n"
-            "  -t  tiempo de servicio en segundos (%d..%d)\n"
-            "  -a  maximo de agentes (1..%d)\n",
-            TAMB_MAX, T_MIN, T_MAX, MAX_AGENTES);
-}
-
-static int leer_entero(const char *texto, long min, long max, char flag, int *salida)
-{
-    char *fin = NULL;
-    long v;
-
-    if (texto == NULL || !isdigit((unsigned char)texto[0])) {
-        fprintf(stderr, "Error: -%c requiere un entero positivo\n", flag);
-        return -1;
-    }
-    errno = 0;
-    v = strtol(texto, &fin, 10);
-    if (errno == ERANGE || *fin != '\0' || v < min || v > max) {
-        fprintf(stderr, "Error: valor de -%c invalido (entero entre %ld y %ld)\n",
-                flag, min, max);
-        return -1;
-    }
-    *salida = (int)v;
+    fflush(stdout);
     return 0;
 }
 
-static int crear_pipe(const char *nombre)
-{
-    struct stat st;
-
-    if (mkfifo(nombre, 0666) == 0) return 0;
-    if (errno != EEXIST) { perror("mkfifo"); return -1; }
-    /* Ya existe: solo se reutiliza si es un FIFO (nunca se borra otro tipo). */
-    if (stat(nombre, &st) != 0 || !S_ISFIFO(st.st_mode)) {
-        fprintf(stderr, "Error: '%s' existe y no es un pipe nominal\n", nombre);
-        return -1;
-    }
-    if (unlink(nombre) != 0 || mkfifo(nombre, 0666) != 0) {
-        perror("mkfifo"); return -1;
-    }
-    return 0;
-}
+/* ------------------------------ main (padre) ----------------------------- */
 
 int main(int argc, char *argv[])
 {
-    const char *a_b = NULL, *a_p = NULL, *a_t = NULL, *a_a = NULL;
-    const char **destino;
-    int op, estado;
-    pid_t hijo;
+    char *arg_b = NULL, *arg_p = NULL, *arg_t = NULL, *arg_a = NULL;
+    struct stat st;
+    pid_t pid;
+    int i, estado;
 
-    opterr = 0;
-    while ((op = getopt(argc, argv, "b:p:t:a:")) != -1) {
-        switch (op) {
-        case 'b': destino = &a_b; break;
-        case 'p': destino = &a_p; break;
-        case 't': destino = &a_t; break;
-        case 'a': destino = &a_a; break;
-        default:
-            fprintf(stderr, "Error: flag desconocido o sin valor\n");
-            mostrar_uso();
-            return EXIT_FAILURE;
+    /* Se esperan 4 flags con su valor: el orden puede cambiar */
+    if (argc != 9) {
+        uso();
+        exit(1);
+    }
+    for (i = 1; i < argc; i += 2) {
+        if (strcmp(argv[i], "-b") == 0)
+            arg_b = argv[i + 1];
+        else if (strcmp(argv[i], "-p") == 0)
+            arg_p = argv[i + 1];
+        else if (strcmp(argv[i], "-t") == 0)
+            arg_t = argv[i + 1];
+        else if (strcmp(argv[i], "-a") == 0)
+            arg_a = argv[i + 1];
+        else {
+            fprintf(stderr, "Error: flag desconocido '%s'\n", argv[i]);
+            uso();
+            exit(1);
         }
-        if (*destino != NULL) {
-            fprintf(stderr, "Error: flag -%c repetido\n", op);
-            mostrar_uso();
-            return EXIT_FAILURE;
+    }
+    if (arg_b == NULL || arg_p == NULL || arg_t == NULL || arg_a == NULL) {
+        fprintf(stderr, "Error: faltan flags (-b, -p, -t y -a son obligatorios)\n");
+        uso();
+        exit(1);
+    }
+    if (!es_numero(arg_b) || atoi(arg_b) < 1) {
+        fprintf(stderr, "Error: tamB '%s' invalido (entero >= 1)\n", arg_b);
+        exit(1);
+    }
+    if (!es_numero(arg_t) || atoi(arg_t) < TIEMPO_MIN || atoi(arg_t) > TIEMPO_MAX) {
+        fprintf(stderr, "Error: time '%s' invalido (entre %d y %d segundos)\n",
+                arg_t, TIEMPO_MIN, TIEMPO_MAX);
+        exit(1);
+    }
+    if (!es_numero(arg_a) || atoi(arg_a) < 1 || atoi(arg_a) > MAX_AGENTES) {
+        fprintf(stderr, "Error: hilos '%s' invalido (entre 1 y %d agentes)\n",
+                arg_a, MAX_AGENTES);
+        exit(1);
+    }
+    tam_buffer = atoi(arg_b);
+    tiempo = atoi(arg_t);
+    max_agentes = atoi(arg_a);
+    nombre_pipe = arg_p;
+
+    /* Crear el pipe nominal. Si ya existe, solo se usa si es un FIFO */
+    if (mkfifo(nombre_pipe, S_IRUSR | S_IWUSR) < 0) {
+        if (errno != EEXIST) {
+            perror("Error en mkfifo");
+            exit(1);
         }
-        *destino = optarg;
+        if (stat(nombre_pipe, &st) < 0 || !S_ISFIFO(st.st_mode)) {
+            fprintf(stderr, "Error: '%s' ya existe y no es un pipe nominal\n", nombre_pipe);
+            exit(1);
+        }
     }
-    if (optind < argc || a_b == NULL || a_p == NULL || a_t == NULL || a_a == NULL) {
-        fprintf(stderr, "Error: faltan flags obligatorios o hay argumentos sobrantes\n");
-        mostrar_uso();
-        return EXIT_FAILURE;
-    }
-    if (leer_entero(a_b, 1, TAMB_MAX, 'b', &tam_b) != 0 ||
-        leer_entero(a_t, T_MIN, T_MAX, 't', &tiempo) != 0 ||
-        leer_entero(a_a, 1, MAX_AGENTES, 'a', &max_agentes) != 0) {
-        mostrar_uso();
-        return EXIT_FAILURE;
-    }
-    if (a_p[0] == '\0') {
-        fprintf(stderr, "Error: el nombre del pipe (-p) esta vacio\n");
-        return EXIT_FAILURE;
-    }
-    nombre_pipe = a_p;
+    signal(SIGINT, manejador_sigint);
 
-    if (crear_pipe(nombre_pipe) != 0) return EXIT_FAILURE;
-
-    hijo = fork();
-    if (hijo < 0) {
-        perror("fork");
+    fflush(stdout);   /* evita que el hijo herede texto pendiente del padre */
+    pid = fork();
+    if (pid < 0) {
+        perror("Error en fork");
         unlink(nombre_pipe);
-        return EXIT_FAILURE;
+        exit(1);
     }
-    if (hijo == 0) {
-        return ejecutar_servidor();
+    if (pid == 0) {   /* hijo: recibe encuestas y muestra el resumen final */
+        signal(SIGINT, SIG_DFL);   /* el padre se encarga de Ctrl+C */
+        exit(servidor());
     }
 
-    /* Padre: espera al hijo y reporta exito o fallo. */
-    while (waitpid(hijo, &estado, 0) < 0) {
-        if (errno != EINTR) { perror("waitpid"); unlink(nombre_pipe); return EXIT_FAILURE; }
-    }
+    /* Padre: espera a que el hijo termine y muestra el resultado */
+    if (wait(&estado) < 0)
+        perror("Error en wait");
     unlink(nombre_pipe);
-    if (WIFEXITED(estado) && WEXITSTATUS(estado) == EXIT_SUCCESS) {
-        printf("\nServidor ISE finalizo con exito.\n");
-        return EXIT_SUCCESS;
+    if (WIFEXITED(estado) && WEXITSTATUS(estado) == 0) {
+        printf("\nServidor ISE finalizó con éxito.\n");
+        return 0;
     }
-    fprintf(stderr, "\nServidor ISE NO finalizo correctamente.\n");
-    return EXIT_FAILURE;
+    printf("\nServidor ISE NO finalizó correctamente.\n");
+    return 1;
 }
