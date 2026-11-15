@@ -17,6 +17,7 @@
 
 #define LOTE      500    /* cada cuantas encuestas se muestra el progreso */
 #define TAM_LINEA 256
+#define ESPERA_CONEXION 10   /* segundos maximos esperando al servidor */
 
 typedef struct {
     int    sector;
@@ -42,15 +43,36 @@ static void manejador_rechazo(int sig)
     _exit(1);
 }
 
-/* Envia un mensaje por el pipe; si falla, libera recursos y termina */
-static void enviar(int fd, mensaje_t *msg, encuesta_t *encuestas)
+/* SIGALRM: el pipe existe pero nadie lo lee (p. ej. el servidor se cayo
+ * sin borrarlo), asi que open() se quedaria bloqueado para siempre */
+static void manejador_espera(int sig)
 {
-    if (write(fd, msg, sizeof(mensaje_t)) != sizeof(mensaje_t)) {
-        perror("Error al enviar (el servidor cerró el pipe)");
-        close(fd);
-        free(encuestas);
-        exit(1);
-    }
+    ssize_t n;
+    char texto[] = "\nNo se pudo conectar: el servidor ISE no responde.\n";
+
+    (void) sig;
+    n = write(STDERR_FILENO, texto, strlen(texto));
+    (void) n;
+    _exit(1);
+}
+
+/* Envia un mensaje por el pipe. Devuelve -1 si el servidor ya no lo lee */
+static int enviar(int fd, mensaje_t *msg)
+{
+    if (write(fd, msg, sizeof(mensaje_t)) != sizeof(mensaje_t))
+        return -1;
+    return 0;
+}
+
+/* El servidor se cayo o se le acabo el tiempo: se cierra todo con orden */
+static void conexion_perdida(int fd, encuesta_t *encuestas, long enviadas, long total)
+{
+    printf("\nSe perdió la conexión con el servidor ISE "
+           "(se cerró o se agotó su tiempo).\n");
+    printf("Enviadas %ld/%ld encuestas.\n\n", enviadas, total);
+    close(fd);
+    free(encuestas);
+    exit(1);
 }
 
 int main(int argc, char *argv[])
@@ -69,6 +91,7 @@ int main(int argc, char *argv[])
      * en lugar de que SIGPIPE termine el proceso sin avisar */
     signal(SIGPIPE, SIG_IGN);
     signal(SIGUSR1, manejador_rechazo);
+    signal(SIGALRM, manejador_espera);
 
     if (argc != 5) {
         uso();
@@ -165,7 +188,11 @@ int main(int argc, char *argv[])
         free(encuestas);
         exit(1);
     }
-    fd = open(pipe_nom, O_WRONLY);   /* se bloquea hasta que el servidor lo abra */
+    /* open se bloquea hasta que el servidor lo abra; la alarma evita
+     * esperar para siempre si el servidor ya no esta */
+    alarm(ESPERA_CONEXION);
+    fd = open(pipe_nom, O_WRONLY);
+    alarm(0);
     if (fd < 0) {
         perror("Error al abrir el pipe");
         free(encuestas);
@@ -179,7 +206,8 @@ int main(int argc, char *argv[])
     strcpy(msg.pais, pais);
     strncpy(msg.nombre, fichero, TAM_NOMBRE - 1);
     msg.tipo = MSG_CONEXION;
-    enviar(fd, &msg, encuestas);
+    if (enviar(fd, &msg) < 0)
+        conexion_perdida(fd, encuestas, 0, total);
 
     /* 5. Enviar las encuestas una por una */
     printf("Enviando...\n");
@@ -187,7 +215,8 @@ int main(int argc, char *argv[])
     for (i = 0; i < total; i++) {
         msg.sector = encuestas[i].sector;
         msg.sentimiento = encuestas[i].sentimiento;
-        enviar(fd, &msg, encuestas);
+        if (enviar(fd, &msg) < 0)
+            conexion_perdida(fd, encuestas, i, total);
         if ((i + 1) % LOTE == 0 && i + 1 < total) {
             printf("  %ld/%ld\n", i + 1, total);
             fflush(stdout);
@@ -197,7 +226,8 @@ int main(int argc, char *argv[])
 
     /* 6. Avisar al servidor que este agente termino */
     msg.tipo = MSG_FIN;
-    enviar(fd, &msg, encuestas);
+    if (enviar(fd, &msg) < 0)
+        conexion_perdida(fd, encuestas, total, total);
     printf("Mensaje de finalización enviado.\n");
     printf("Envío %s finalizado satisfactoriamente!!.\n\n", pais);
 
