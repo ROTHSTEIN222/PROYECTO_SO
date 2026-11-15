@@ -37,6 +37,7 @@
 /* Valores especiales de sector para avisar al hilo del agente que termine */
 #define FIN_AGENTE   -1   /* el agente envio todas sus encuestas */
 #define FIN_TIEMPO   -2   /* se acabo el tiempo del servidor     */
+#define FIN_CAIDA    -3   /* el agente se cerro antes de terminar */
 
 typedef struct {
     int    sector;
@@ -53,7 +54,8 @@ typedef struct {
     sem_t       elementos;       /* registros listos para leer  */
     sem_t       mutex;           /* acceso exclusivo al buffer  */
     pthread_t   hilo;
-    int         terminado;       /* 1 si ya llego el MSG_FIN    */
+    int         terminado;       /* 1 si ya no va a enviar mas  */
+    int         desconectado;    /* 1 si se cerro sin enviar MSG_FIN */
     long        cantidad[NUM_SECTORES];
     double      suma[NUM_SECTORES];
 } agente_t;
@@ -63,6 +65,7 @@ static agente_t agentes[MAX_AGENTES];
 static int num_agentes = 0;
 static int tam_buffer, tiempo, max_agentes;
 static char *nombre_pipe;
+static pid_t pid_hijo = 0;
 static pthread_mutex_t mutex_pantalla = PTHREAD_MUTEX_INITIALIZER;
 
 static void uso(void)
@@ -74,12 +77,15 @@ static void uso(void)
     fprintf(stderr, "  -a  cantidad maxima de agentes/hilos (1 a %d)\n", MAX_AGENTES);
 }
 
-/* Ctrl+C: se borra el pipe nominal para no dejar basura en el disco */
-static void manejador_sigint(int sig)
+/* Ctrl+C, kill o cierre de la terminal: se termina tambien al hijo y se
+ * borra el pipe nominal para no dejar basura en el disco */
+static void manejador_salida(int sig)
 {
     ssize_t n;
 
     (void) sig;
+    if (pid_hijo > 0)
+        kill(pid_hijo, SIGTERM);
     unlink(nombre_pipe);
     n = write(STDOUT_FILENO, "\nServidor ISE interrumpido.\n", 28);
     (void) n;
@@ -130,6 +136,8 @@ static void imprimir_reporte_parcial(agente_t *a)
 
     pthread_mutex_lock(&mutex_pantalla);   /* que no se mezcle con otros hilos */
     printf("\n----- Reporte parcial: %s (%s) -----\n", a->pais, a->nombre);
+    if (a->desconectado)
+        printf("  El agente se desconectó antes de terminar (datos incompletos)\n");
     for (s = 0; s < NUM_SECTORES; s++) {
         if (a->cantidad[s] > 0)
             printf("  %-*s %6ld encuestas, promedio %6.2f%%\n",
@@ -175,7 +183,8 @@ static void imprimir_resumen_general(void)
         else
             printf("  %s (%s): %ld encuestas, ISE %.2f%% -> %s%s\n", a->pais,
                    a->nombre, total, ise, recomendacion(ise),
-                   a->terminado ? "" : " (incompleto: tiempo agotado)");
+                   a->desconectado ? " (incompleto: agente desconectado)" :
+                   !a->terminado ? " (incompleto: tiempo agotado)" : "");
     }
 
     printf("\n  Promedio por sector (todos los países):\n");
@@ -229,8 +238,8 @@ static void *hilo_agente(void *arg)
         }
     } while (r.sector >= 0);
 
-    /* Solo emite reporte parcial si el agente termino de enviar */
-    if (r.sector == FIN_AGENTE)
+    /* Reporte parcial si el agente termino o se cayo (no por tiempo) */
+    if (r.sector == FIN_AGENTE || r.sector == FIN_CAIDA)
         imprimir_reporte_parcial(a);
     pthread_exit(NULL);
 }
@@ -259,9 +268,9 @@ static void registrar_agente(mensaje_t *msg)
         printf("\nAgente %s (%s) rechazado: ya hay %d agentes conectados.\n",
                msg->pais, msg->nombre, max_agentes);
         pthread_mutex_unlock(&mutex_pantalla);
-        /* El pipe va en un solo sentido: se le avisa al agente con una senal */
-        if (kill(msg->pid, SIGUSR1) < 0)
-            perror("Error en kill");
+        /* El pipe va en un solo sentido: se le avisa al agente con una
+         * senal. Si el agente ya no existe, kill falla y no pasa nada */
+        kill(msg->pid, SIGUSR1);
         return;
     }
 
@@ -322,6 +331,24 @@ static int procesar_mensaje(mensaje_t *msg)
     return 1;
 }
 
+/*
+ * read devolvio 0: ya no queda ningun agente con el pipe abierto. Un agente
+ * mantiene el pipe abierto hasta despues de enviar MSG_FIN, asi que si alguno
+ * no lo envio es porque se cerro antes (Ctrl+C, kill, error...)
+ */
+static void revisar_desconectados(void)
+{
+    int i;
+
+    for (i = 0; i < num_agentes; i++) {
+        if (!agentes[i].terminado) {
+            agentes[i].terminado = 1;
+            agentes[i].desconectado = 1;
+            depositar(&agentes[i], FIN_CAIDA, 0.0);
+        }
+    }
+}
+
 /* ------------------------------- Hilos ----------------------------------- */
 
 /* Lee el pipe nominal y reparte cada encuesta al buffer de su agente */
@@ -345,7 +372,9 @@ static void *hilo_recolector(void *arg)
             if (n == sizeof(mensaje_t))
                 seguir = procesar_mensaje(&msg);
         }
-        if (n < 0)
+        if (n == 0)
+            revisar_desconectados();
+        else if (n < 0)
             perror("Error al leer el pipe");
         close(fd);
     }
@@ -489,7 +518,12 @@ int main(int argc, char *argv[])
             exit(1);
         }
     }
-    signal(SIGINT, manejador_sigint);
+    signal(SIGINT, manejador_salida);
+    signal(SIGTERM, manejador_salida);
+    signal(SIGHUP, manejador_salida);
+    /* Si se escribe en el pipe sin lector, write devuelve error en vez de
+     * que SIGPIPE termine el proceso */
+    signal(SIGPIPE, SIG_IGN);
 
     fflush(stdout);   /* evita que el hijo herede texto pendiente del padre */
     pid = fork();
@@ -499,9 +533,12 @@ int main(int argc, char *argv[])
         exit(1);
     }
     if (pid == 0) {   /* hijo: recibe encuestas y muestra el resumen final */
-        signal(SIGINT, SIG_DFL);   /* el padre se encarga de Ctrl+C */
+        signal(SIGINT, SIG_DFL);   /* el padre se encarga de limpiar */
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
         exit(servidor());
     }
+    pid_hijo = pid;
 
     /* Padre: espera a que el hijo termine y muestra el resultado */
     if (wait(&estado) < 0)
@@ -511,6 +548,10 @@ int main(int argc, char *argv[])
         printf("\nServidor ISE finalizó con éxito.\n");
         return 0;
     }
-    printf("\nServidor ISE NO finalizó correctamente.\n");
+    if (WIFSIGNALED(estado))
+        printf("\nServidor ISE NO finalizó correctamente "
+               "(el proceso hijo terminó por la señal %d).\n", WTERMSIG(estado));
+    else
+        printf("\nServidor ISE NO finalizó correctamente.\n");
     return 1;
 }
